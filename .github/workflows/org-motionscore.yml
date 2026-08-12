@@ -1,0 +1,128 @@
+name: MotionScore Guard
+
+# Org-wide CI. Enforced across every Devilos repo via the "Require org CI"
+# ruleset, so there is deliberately NO copy of this file in each repo.
+#
+# The vendor guide (https://score.motion.dev/docs/guard) wires the action to
+# `deployment_status`. That trigger cannot be used here: ruleset-required
+# workflows only support pull_request / pull_request_target / merge_group, so a
+# deployment_status workflow can never be a merge gate — it can only report
+# after the fact. Instead this runs on `pull_request` and hands the action an
+# explicit `url:`. The action supports precisely that split ("Defaults to the
+# preview URL from the deployment_status event, so it can be omitted on
+# preview-deploy workflows"), so the audit itself is unchanged; only the way it
+# learns the URL differs.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: org-motionscore-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: MotionScore Guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      deployments: read
+      # write on pull-requests is what lets the sticky results comment be
+      # posted. With read the audit still runs and the comment is silently
+      # discarded — the same failure mode org-claude-code-review.yml sat in.
+      pull-requests: write
+
+    steps:
+      # This workflow is a MERGE GATE for the whole org, so it must never
+      # hard-fail merely because a repo can't reach the token. `threshold`
+      # requires a paid MotionScore plan; while MOTIONSCORE_TOKEN is empty every
+      # run would exit 2 (infrastructure error) and block every PR in every repo.
+      - name: Check for audit token
+        id: guard
+        env:
+          MOTIONSCORE_TOKEN: ${{ secrets.MOTIONSCORE_TOKEN }}
+        run: |
+          if [ -z "${MOTIONSCORE_TOKEN:-}" ]; then
+            echo "::warning::MOTIONSCORE_TOKEN is empty or not visible to ${{ github.repository }} — skipping the audit. Fill in the organization secret to enable this."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Only some repos publish a PR preview (today: devilos.org, via its own
+      # preview.yml). Rather than turn the rest permanently red, look for a
+      # `preview` deployment on this PR's head SHA and skip where there is none.
+      #
+      # Deliberately a two-stage wait. Repos that will never publish a preview
+      # must not sit burning a runner for the full deploy timeout, so: give the
+      # deployment 60s to be CREATED at all, and only once it exists wait up to
+      # 15 minutes for it to go green.
+      - name: Wait for preview deployment
+        id: preview
+        if: steps.guard.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -uo pipefail
+
+          id=""
+          for _ in $(seq 1 12); do
+            id=$(gh api "repos/$REPO/deployments?sha=$SHA&environment=preview" --jq '.[0].id // empty' 2>/dev/null || true)
+            [ -n "$id" ] && break
+            sleep 5
+          done
+
+          if [ -z "$id" ]; then
+            echo "::notice::No \`preview\` deployment for $SHA — this repo does not publish PR previews, so there is nothing to audit. Skipping."
+            echo "url=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          for _ in $(seq 1 90); do
+            payload=$(gh api "repos/$REPO/deployments/$id/statuses?per_page=1" 2>/dev/null || echo '[]')
+            state=$(echo "$payload" | jq -r '.[0].state // "pending"')
+            url=$(echo "$payload" | jq -r '.[0].environment_url // ""')
+
+            case "$state" in
+              success)
+                if [ -z "$url" ]; then
+                  echo "::warning::Preview deployment $id succeeded but carries no environment_url — nothing to audit. Skipping."
+                  echo "url=" >> "$GITHUB_OUTPUT"
+                else
+                  echo "Auditing preview: $url"
+                  echo "url=$url" >> "$GITHUB_OUTPUT"
+                fi
+                exit 0
+                ;;
+              failure|error|inactive)
+                # The preview build is the PR author's problem and its own job
+                # already reports red; do not double-fail the merge on it.
+                echo "::warning::Preview deployment $id ended in '$state' — skipping the audit."
+                echo "url=" >> "$GITHUB_OUTPUT"
+                exit 0
+                ;;
+            esac
+            sleep 10
+          done
+
+          echo "::warning::Preview deployment $id never reached 'success' within 15 minutes — skipping the audit."
+          echo "url=" >> "$GITHUB_OUTPUT"
+
+      # `pages` is per-repo: the org default audits the site root, and any repo
+      # that wants more sets a MOTIONSCORE_PAGES repository variable with one
+      # path per line (devilos.org, for instance, wants `/` and `/privacy`).
+      # A variable rather than a secret because these are just paths, and an
+      # unset `vars.X` resolves to an empty string, which `||` turns back into
+      # the default.
+      - name: Audit animation performance
+        if: steps.guard.outputs.enabled == 'true' && steps.preview.outputs.url != ''
+        uses: motiondivision/motionscore-guard@v1
+        with:
+          url: ${{ steps.preview.outputs.url }}
+          pages: ${{ vars.MOTIONSCORE_PAGES || '/' }}
+          threshold: A
+          token: ${{ secrets.MOTIONSCORE_TOKEN }}
