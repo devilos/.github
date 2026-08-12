@@ -1,0 +1,114 @@
+name: Tests
+
+# Org-wide CI. Enforced across every Devilos repo via the "Protect default branch"
+# ruleset (org Settings -> Repository -> Rulesets -> Require workflows to pass
+# before merging), so there is deliberately NO copy of this file in each repo.
+#
+# Ruleset-required workflows only support pull_request / pull_request_target /
+# merge_group, so this is a standalone workflow rather than a reusable
+# `workflow_call` one.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: org-tests-${{ github.repository }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Repos across the org genuinely differ — pnpm vs npm, different pinned Node
+      # versions, and only some have a test suite at all. Rather than turn the
+      # others permanently red (this workflow is a MERGE GATE), detect what each
+      # repo actually supports and degrade:
+      #
+      #   `test` script    -> run it  (arcanius, endpaper, voider — vitest)
+      #   `compile` script -> run it  (dealter, debait — tsc --noEmit)
+      #   neither          -> skip    (novaling, snip-wtf, uw-v4 root)
+      #
+      # e2e is deliberately never run: every repo keeps Playwright behind its own
+      # `test:e2e` script, so a plain `test` is already e2e-free.
+      - name: Detect project setup
+        id: detect
+        run: |
+          set -euo pipefail
+
+          if [ ! -f package.json ]; then
+            echo "No package.json at the repo root — nothing to run."
+            echo "run=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ -f pnpm-lock.yaml ]; then pm=pnpm; else pm=npm; fi
+
+          # Honour whatever Node version the repo pins for itself, else a current
+          # default. A wrong pin should fail loudly here rather than be papered over.
+          node_version=24
+          if [ -f .nvmrc ]; then
+            node_version=$(tr -d 'v \t\r\n' < .nvmrc)
+          elif [ -f .node-version ]; then
+            node_version=$(tr -d 'v \t\r\n' < .node-version)
+          elif [ -f .tool-versions ]; then
+            node_version=$(awk '/^nodejs[[:space:]]/ { print $2; exit }' .tool-versions)
+          fi
+          [ -n "$node_version" ] || node_version=24
+
+          if [ -n "$(jq -r '.scripts.test // empty' package.json)" ]; then
+            run=test
+          elif [ -n "$(jq -r '.scripts.compile // empty' package.json)" ]; then
+            run=compile
+          else
+            run=none
+          fi
+
+          {
+            echo "pm=$pm"
+            echo "node_version=$node_version"
+            echo "run=$run"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "package manager: $pm | node: $node_version | script: $run"
+
+      # pnpm must be on PATH before setup-node, or `cache: pnpm` can't resolve its
+      # store. Version comes from each repo's own `packageManager` field.
+      - uses: pnpm/action-setup@v6
+        if: steps.detect.outputs.run != 'none' && steps.detect.outputs.pm == 'pnpm'
+
+      - uses: actions/setup-node@v6
+        if: steps.detect.outputs.run != 'none'
+        with:
+          node-version: ${{ steps.detect.outputs.node_version }}
+          cache: ${{ steps.detect.outputs.pm }}
+
+      - name: Install dependencies
+        if: steps.detect.outputs.run != 'none'
+        env:
+          PM: ${{ steps.detect.outputs.pm }}
+        run: |
+          set -euo pipefail
+          if [ "$PM" = "pnpm" ]; then
+            pnpm install --frozen-lockfile
+          else
+            npm ci
+          fi
+
+      - name: Run ${{ steps.detect.outputs.run }}
+        if: steps.detect.outputs.run != 'none'
+        env:
+          PM: ${{ steps.detect.outputs.pm }}
+          SCRIPT: ${{ steps.detect.outputs.run }}
+        run: |
+          set -euo pipefail
+          "$PM" run "$SCRIPT"
+
+      - name: Nothing to run
+        if: steps.detect.outputs.run == 'none'
+        run: |
+          echo "::notice::No \`test\` or \`compile\` script found — skipping. Add one and this job starts covering the repo automatically."
