@@ -118,11 +118,32 @@ jobs:
       # A variable rather than a secret because these are just paths, and an
       # unset `vars.X` resolves to an empty string, which `||` turns back into
       # the default.
+      #
+      # Stripping \r is not optional. GitHub stores a variable edited in the web
+      # UI with CRLF endings, and the action trims each path with `xargs`, which
+      # does not count \r as whitespace — so every line but the last keeps one.
+      # That CR rides through the audit into the results comment, where GitHub
+      # renders it as a line break inside a table cell and splits the row in
+      # half. Normalising here fixes it for every repo at once, rather than
+      # depending on each one to have set its variable through the API.
+      - name: Normalise page list
+        id: pages
+        if: steps.guard.outputs.enabled == 'true' && steps.preview.outputs.url != ''
+        env:
+          RAW: ${{ vars.MOTIONSCORE_PAGES }}
+        run: |
+          set -uo pipefail
+          {
+            echo "list<<MOTIONSCORE_PAGES_EOF"
+            printf '%s\n' "${RAW:-/}" | tr -d '\r' | sed '/^[[:space:]]*$/d'
+            echo "MOTIONSCORE_PAGES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Audit animation performance
         if: steps.guard.outputs.enabled == 'true' && steps.preview.outputs.url != ''
         uses: motiondivision/motionscore-guard@v1
         with:
           url: ${{ steps.preview.outputs.url }}
-          pages: ${{ vars.MOTIONSCORE_PAGES || '/' }}
+          pages: ${{ steps.pages.outputs.list }}
           threshold: A
           token: ${{ secrets.MOTIONSCORE_TOKEN }}
