@@ -56,6 +56,11 @@ jobs:
         uses: anthropics/claude-code-action@v1
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # PostHog's self-driving fixes open PRs as the posthog-eu GitHub App. The action
+          # refuses any bot actor not listed here (the [bot] suffix is optional), and since
+          # this workflow is a required merge gate, that blocked merging every one of those
+          # PRs. Name the bot explicitly rather than '*' so no other App can trigger a review.
+          allowed_bots: 'posthog-eu'
           plugin_marketplaces: 'https://github.com/anthropics/claude-code.git'
           plugins: 'code-review@claude-code-plugins'
           prompt: '/code-review:code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
